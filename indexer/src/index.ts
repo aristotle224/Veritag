@@ -1,4 +1,4 @@
-import { createServer, type Server } from "node:http";
+import { AlertService } from "./alerts.js";
 import { IndexerPoller, RpcEventsProvider } from "./poller.js";
 import { InMemoryIndexerWriter, PostgresIndexerWriter } from "./writer.js";
 
@@ -12,10 +12,12 @@ const confirmationLedgers = Number(process.env.INDEXER_CONFIRMATION_LEDGERS ?? 2
 const healthPort = Number(process.env.INDEXER_HEALTH_PORT ?? process.env.PORT ?? 8080);
 const maxAllowedLag = Number(process.env.MAX_ALLOWED_LAG ?? 50);
 
+const alertService = new AlertService();
+
 const writer =
   process.env.USE_IN_MEMORY_DB === "true"
-    ? new InMemoryIndexerWriter()
-    : new PostgresIndexerWriter(databaseUrl);
+    ? new InMemoryIndexerWriter(alertService)
+    : new PostgresIndexerWriter(databaseUrl, alertService);
 
 const provider = new RpcEventsProvider(rpcUrl);
 const poller = new IndexerPoller({
