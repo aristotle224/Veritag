@@ -3,7 +3,7 @@ import { sha256 } from "@veritag/sdk";
 import type pg from "pg";
 import { describe, expect, it } from "vitest";
 import { decodeRegistryEvent, type RawSorobanEvent } from "../src/decoder.js";
-import { parseCliArgs } from "../src/index.js";
+import { createHealthServer, parseCliArgs } from "../src/index.js";
 import { IndexerPoller, type SorobanEventsProvider } from "../src/poller.js";
 import { InMemoryIndexerWriter, PostgresIndexerWriter } from "../src/writer.js";
 
@@ -272,5 +272,146 @@ describe("@veritag/indexer XDR decoder, poller, and idempotent writer", () => {
     const duplicateDecoded = decodeRegistryEvent(rawPage1[0]!)!;
     const dupRes = await pgWriter.applyEvent(duplicateDecoded, true);
     expect(dupRes.applied).toBe(false);
+  });
+
+  it("materializes provenance edges across activation, multiple transfers, and retirement", async () => {
+    const brand = Keypair.random().publicKey();
+    const distributor = Keypair.random().publicKey();
+    const retailer = Keypair.random().publicKey();
+    const consumer = Keypair.random().publicKey();
+    const batchId = sha256("BATCH-PROV-01");
+    const unitId = sha256("UNIT-PROV-01");
+    const reportHash = sha256("REPORT-PROV-01");
+
+    const rawEvents: RawSorobanEvent[] = [
+      {
+        id: "000200-1",
+        ledger: 200,
+        txHash: "tx-act",
+        ledgerClosedAt: "2026-01-01T00:00:00.000Z",
+        topic: [scSym("unit_activated"), scBytes32(unitId)],
+        value: scMap([
+          ["brand", scAddr(brand)],
+          ["batch_id", scBytes32(batchId)],
+          ["owner", scAddr(distributor)],
+          ["warranty_expiry", nativeToScVal(1_900_000_000n, { type: "u64" })],
+        ]),
+      },
+      {
+        id: "000201-1",
+        ledger: 201,
+        txHash: "tx-xfer-1",
+        ledgerClosedAt: "2026-01-02T00:00:00.000Z",
+        topic: [scSym("unit_transferred"), scBytes32(unitId)],
+        value: scMap([
+          ["from", scAddr(distributor)],
+          ["to", scAddr(retailer)],
+        ]),
+      },
+      {
+        id: "000202-1",
+        ledger: 202,
+        txHash: "tx-xfer-2",
+        ledgerClosedAt: "2026-01-03T00:00:00.000Z",
+        topic: [scSym("unit_transferred"), scBytes32(unitId)],
+        value: scMap([
+          ["from", scAddr(retailer)],
+          ["to", scAddr(consumer)],
+        ]),
+      },
+      {
+        id: "000203-1",
+        ledger: 203,
+        txHash: "tx-retire",
+        ledgerClosedAt: "2026-01-04T00:00:00.000Z",
+        topic: [scSym("claim_resolved"), scBytes32(unitId)],
+        value: scMap([
+          ["claim_id", nativeToScVal(1, { type: "u32" })],
+          ["outcome", nativeToScVal(4, { type: "u32" })], // Replaced = 4 -> Retired
+          ["report_hash", scBytes32(reportHash)],
+        ]),
+      },
+    ];
+
+    const writer = new InMemoryIndexerWriter();
+    for (const raw of rawEvents) {
+      const decoded = decodeRegistryEvent(raw)!;
+      await writer.applyEvent(decoded, true);
+    }
+
+    const unitHex = unitId.toString("hex");
+    const unitEdges = writer.provenanceEdges.filter((e) => e.unitId === unitHex);
+    expect(unitEdges).toHaveLength(4);
+    expect(unitEdges.map((e) => [e.fromNode, e.toNode, e.transitionType])).toEqual([
+      [brand, distributor, "UnitActivated"],
+      [distributor, retailer, "UnitTransferred"],
+      [retailer, consumer, "UnitTransferred"],
+      [consumer, "RETIRED", "UnitRetired"],
+    ]);
+
+    const executedSql: string[] = [];
+    const mockClient = {
+      query: async (sql: string) => {
+        executedSql.push(sql.trim());
+        return { rowCount: 1, rows: [{ id: "ok" }] };
+      },
+      release: () => {},
+    };
+    const mockPool = {
+      connect: async () => mockClient,
+      query: async () => ({ rowCount: 0, rows: [] }),
+      end: async () => {},
+    } as unknown as pg.Pool;
+
+    const pgWriter = new PostgresIndexerWriter(mockPool);
+    for (const raw of rawEvents) {
+      await pgWriter.applyEvent(decodeRegistryEvent(raw)!, true);
+    }
+    expect(
+      executedSql.filter((s) => s.includes("INSERT INTO unit_provenance_edges")).length,
+    ).toBe(4);
+  });
+
+  it("reports healthy or lagging status via IndexerPoller and /healthz HTTP server", async () => {
+    const writer = new InMemoryIndexerWriter();
+    let shouldFail = false;
+    const provider: SorobanEventsProvider = {
+      async fetchEvents() {
+        if (shouldFail) {
+          throw new Error("RPC connection stalled");
+        }
+        return { latestLedger: 500, cursor: "c-500", events: [] };
+      },
+    };
+    const poller = new IndexerPoller({
+      contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+      provider,
+      writer,
+    });
+
+    await poller.pollOnce();
+    expect(poller.getHealthStatus(50)).toEqual({
+      status: "healthy",
+      lag: 0,
+      latestLedger: 500,
+      currentLedger: 500,
+    });
+
+    shouldFail = true;
+    await expect(poller.pollOnce()).rejects.toThrow("RPC connection stalled");
+    expect(poller.getHealthStatus(50).status).toBe("lagging");
+
+    const server = createHealthServer(poller, 50);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    try {
+      const addr = server.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      const res = await fetch(`http://127.0.0.1:${port}/healthz`);
+      expect(res.status).toBe(503);
+      const body = (await res.json()) as { status: string; lag: number };
+      expect(body.status).toBe("lagging");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });

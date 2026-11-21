@@ -156,3 +156,16 @@ CREATE TABLE IF NOT EXISTS passkey_wallets (
 );
 
 CREATE INDEX IF NOT EXISTS idx_passkey_wallets_address ON passkey_wallets(wallet_address);
+
+CREATE TABLE IF NOT EXISTS unit_provenance_edges (
+  id TEXT PRIMARY KEY,
+  unit_id TEXT NOT NULL,
+  from_node TEXT NOT NULL,
+  to_node TEXT NOT NULL,
+  transition_type TEXT NOT NULL,
+  tx_hash TEXT NOT NULL,
+  block_time TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_unit_provenance_edges_unit_id
+  ON unit_provenance_edges(unit_id, block_time ASC);

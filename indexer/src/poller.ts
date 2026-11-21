@@ -69,12 +69,22 @@ export interface IndexerPollerOptions {
   batchLimit?: number;
 }
 
+export interface IndexerHealthStatus {
+  status: "healthy" | "lagging";
+  lag: number;
+  latestLedger: number | null;
+  currentLedger: number;
+}
+
 export class IndexerPoller {
   private readonly contractId: string;
   private readonly provider: SorobanEventsProvider;
   private readonly writer: IndexerWriter;
   private readonly confirmationLedgers: number;
   private readonly batchLimit: number;
+  private latestNetworkLedger: number | null = null;
+  private currentLedger = 0;
+  private lastPollError: string | null = null;
 
   constructor(options: IndexerPollerOptions) {
     this.contractId = options.contractId;
@@ -85,59 +95,86 @@ export class IndexerPoller {
   }
 
   /**
+   * Returns current ledger ingestion lag and container health status.
+   */
+  getHealthStatus(maxAllowedLag = 50): IndexerHealthStatus {
+    const lag =
+      this.latestNetworkLedger === null
+        ? 0
+        : Math.max(0, this.latestNetworkLedger - this.currentLedger);
+    const lagging = this.lastPollError !== null || lag > maxAllowedLag;
+    return {
+      status: lagging ? "lagging" : "healthy",
+      lag,
+      latestLedger: this.latestNetworkLedger,
+      currentLedger: this.currentLedger,
+    };
+  }
+
+  /**
    * Executes one idempotent poll cycle, decoding events, updating database projections,
    * advancing the saved cursor, and promoting confirmed events to finalized.
    */
   async pollOnce(): Promise<{ fetched: number; applied: number; finalized: number }> {
-    const cursorState = await this.writer.getCursor();
-
-    let page: EventPageResponse;
     try {
-      page = await this.provider.fetchEvents({
-        contractId: this.contractId,
-        cursor: cursorState.lastCursor || undefined,
-        startLedger: cursorState.lastCursor ? undefined : Math.max(1, cursorState.lastLedger),
-        limit: this.batchLimit,
-      });
-    } catch {
-      // Handle RPC retention window cursor expiration by falling back to startLedger
-      page = await this.provider.fetchEvents({
-        contractId: this.contractId,
-        startLedger: Math.max(1, cursorState.lastLedger),
-        limit: this.batchLimit,
-      });
-    }
+      const cursorState = await this.writer.getCursor();
+      this.currentLedger = cursorState.lastLedger;
 
-    const confirmedCutoff = page.latestLedger - this.confirmationLedgers;
-    let appliedCount = 0;
-    let highestLedger = cursorState.lastLedger;
-
-    for (const rawEv of page.events) {
-      highestLedger = Math.max(highestLedger, rawEv.ledger);
-      const decoded = decodeRegistryEvent(rawEv);
-      if (!decoded) continue;
-
-      const isFinalized = decoded.ledger <= confirmedCutoff;
-      const { applied } = await this.writer.applyEvent(decoded, isFinalized);
-      if (applied) {
-        appliedCount++;
+      let page: EventPageResponse;
+      try {
+        page = await this.provider.fetchEvents({
+          contractId: this.contractId,
+          cursor: cursorState.lastCursor || undefined,
+          startLedger: cursorState.lastCursor ? undefined : Math.max(1, cursorState.lastLedger),
+          limit: this.batchLimit,
+        });
+      } catch {
+        // Handle RPC retention window cursor expiration by falling back to startLedger
+        page = await this.provider.fetchEvents({
+          contractId: this.contractId,
+          startLedger: Math.max(1, cursorState.lastLedger),
+          limit: this.batchLimit,
+        });
       }
+
+      this.latestNetworkLedger = page.latestLedger;
+      const confirmedCutoff = page.latestLedger - this.confirmationLedgers;
+      let appliedCount = 0;
+      let highestLedger = cursorState.lastLedger;
+
+      for (const rawEv of page.events) {
+        highestLedger = Math.max(highestLedger, rawEv.ledger);
+        const decoded = decodeRegistryEvent(rawEv);
+        if (!decoded) continue;
+
+        const isFinalized = decoded.ledger <= confirmedCutoff;
+        const { applied } = await this.writer.applyEvent(decoded, isFinalized);
+        if (applied) {
+          appliedCount++;
+        }
+      }
+
+      const newlyFinalized = await this.writer.finalizeEventsUpTo(confirmedCutoff);
+
+      const nextLedger = Math.max(highestLedger, page.latestLedger);
+      if (page.events.length > 0 || page.cursor) {
+        await this.writer.saveCursor({
+          lastLedger: nextLedger,
+          lastCursor: page.cursor || cursorState.lastCursor,
+        });
+      }
+      this.currentLedger = nextLedger;
+      this.lastPollError = null;
+
+      return {
+        fetched: page.events.length,
+        applied: appliedCount,
+        finalized: newlyFinalized,
+      };
+    } catch (err) {
+      this.lastPollError = err instanceof Error ? err.message : String(err);
+      throw err;
     }
-
-    const newlyFinalized = await this.writer.finalizeEventsUpTo(confirmedCutoff);
-
-    if (page.events.length > 0 || page.cursor) {
-      await this.writer.saveCursor({
-        lastLedger: Math.max(highestLedger, page.latestLedger),
-        lastCursor: page.cursor || cursorState.lastCursor,
-      });
-    }
-
-    return {
-      fetched: page.events.length,
-      applied: appliedCount,
-      finalized: newlyFinalized,
-    };
   }
 
   /**

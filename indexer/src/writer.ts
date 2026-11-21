@@ -15,6 +15,16 @@ export interface IndexerWriter {
 
 const DEFAULT_STREAM_ID = "soroban-registry";
 
+export interface ProvenanceEdge {
+  id: string;
+  unitId: string;
+  fromNode: string;
+  toNode: string;
+  transitionType: "UnitActivated" | "UnitTransferred" | "UnitRetired";
+  txHash: string;
+  blockTime: string;
+}
+
 export class InMemoryIndexerWriter implements IndexerWriter {
   private readonly cursors = new Map<string, IndexerCursorState>();
   public readonly events = new Map<
@@ -42,6 +52,7 @@ export class InMemoryIndexerWriter implements IndexerWriter {
     string,
     { serviceCenter: string; outcome: string; reportHash: string }
   >();
+  public readonly provenanceEdges: ProvenanceEdge[] = [];
 
   async getCursor(streamId = DEFAULT_STREAM_ID): Promise<IndexerCursorState> {
     return this.cursors.get(streamId) ?? { lastLedger: 0, lastCursor: "" };
@@ -89,6 +100,15 @@ export class InMemoryIndexerWriter implements IndexerWriter {
           claimsUsed: 0,
           duplicateAttempts: 0,
         });
+        this.provenanceEdges.push({
+          id: `${event.id}:UnitActivated`,
+          unitId: event.unitId,
+          fromNode: event.brand,
+          toNode: event.owner,
+          transitionType: "UnitActivated",
+          txHash: event.txHash,
+          blockTime: event.createdAt,
+        });
         break;
       case "duplicate_attempt": {
         const u = this.units.get(event.unitId);
@@ -102,6 +122,15 @@ export class InMemoryIndexerWriter implements IndexerWriter {
         if (u) {
           this.units.set(event.unitId, { ...u, owner: event.to });
         }
+        this.provenanceEdges.push({
+          id: `${event.id}:UnitTransferred`,
+          unitId: event.unitId,
+          fromNode: event.from,
+          toNode: event.to,
+          transitionType: "UnitTransferred",
+          txHash: event.txHash,
+          blockTime: event.createdAt,
+        });
         break;
       }
       case "claim_filed": {
@@ -132,6 +161,15 @@ export class InMemoryIndexerWriter implements IndexerWriter {
           if (u) {
             this.units.set(event.unitId, { ...u, status: "Retired" });
           }
+          this.provenanceEdges.push({
+            id: `${event.id}:UnitRetired`,
+            unitId: event.unitId,
+            fromNode: u?.owner ?? "",
+            toNode: "RETIRED",
+            transitionType: "UnitRetired",
+            txHash: event.txHash,
+            blockTime: event.createdAt,
+          });
         }
         break;
       }
@@ -305,6 +343,19 @@ export class PostgresIndexerWriter implements IndexerWriter {
              SET owner = EXCLUDED.owner, warranty_expiry = EXCLUDED.warranty_expiry, updated_at = NOW()`,
             [event.unitId, event.brand, event.batchId, event.owner, tsSec, event.warrantyExpiry],
           );
+          await client.query(
+            `INSERT INTO unit_provenance_edges (id, unit_id, from_node, to_node, transition_type, tx_hash, block_time)
+             VALUES ($1, $2, $3, $4, 'UnitActivated', $5, $6)
+             ON CONFLICT (id) DO NOTHING`,
+            [
+              `${event.id}:UnitActivated`,
+              event.unitId,
+              event.brand,
+              event.owner,
+              event.txHash,
+              event.createdAt,
+            ],
+          );
           break;
         }
 
@@ -319,6 +370,19 @@ export class PostgresIndexerWriter implements IndexerWriter {
           await client.query(
             `UPDATE units SET owner = $2, updated_at = NOW() WHERE unit_id = $1`,
             [event.unitId, event.to],
+          );
+          await client.query(
+            `INSERT INTO unit_provenance_edges (id, unit_id, from_node, to_node, transition_type, tx_hash, block_time)
+             VALUES ($1, $2, $3, $4, 'UnitTransferred', $5, $6)
+             ON CONFLICT (id) DO NOTHING`,
+            [
+              `${event.id}:UnitTransferred`,
+              event.unitId,
+              event.from,
+              event.to,
+              event.txHash,
+              event.createdAt,
+            ],
           );
           break;
 
@@ -345,6 +409,12 @@ export class PostgresIndexerWriter implements IndexerWriter {
             [event.unitId, event.claimId, event.outcome, event.reportHash, resolvedAt],
           );
           if (event.outcome === "Replaced") {
+            await client.query(
+              `INSERT INTO unit_provenance_edges (id, unit_id, from_node, to_node, transition_type, tx_hash, block_time)
+               VALUES ($1, $2, COALESCE((SELECT owner FROM units WHERE unit_id = $2), ''), 'RETIRED', 'UnitRetired', $3, $4)
+               ON CONFLICT (id) DO NOTHING`,
+              [`${event.id}:UnitRetired`, event.unitId, event.txHash, event.createdAt],
+            );
             await client.query(
               `UPDATE units SET status = 'Retired', updated_at = NOW() WHERE unit_id = $1`,
               [event.unitId],

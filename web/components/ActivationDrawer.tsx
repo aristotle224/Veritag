@@ -9,9 +9,15 @@ interface ActivationDrawerProps {
   brand: string;
   batchId: string;
   serial: string;
+  disabled?: boolean;
 }
 
-export function ActivationDrawer({ brand, batchId, serial }: ActivationDrawerProps) {
+export function ActivationDrawer({
+  brand,
+  batchId,
+  serial,
+  disabled = false,
+}: ActivationDrawerProps) {
   const router = useRouter();
   const { session, connectPasskey, connectRoleKeypair, signContractAction } = useWallet();
   const [secret, setSecret] = useState("");
@@ -52,7 +58,7 @@ export function ActivationDrawer({ brand, batchId, serial }: ActivationDrawerPro
 
   async function handleActivate(e: React.FormEvent) {
     e.preventDefault();
-    if (!secret.trim() || !ownerAddress.trim()) return;
+    if (disabled || !secret.trim() || !ownerAddress.trim()) return;
     setSubmitting(true);
     setStatusMsg(null);
     try {
@@ -148,7 +154,7 @@ export function ActivationDrawer({ brand, batchId, serial }: ActivationDrawerPro
 
         <button
           type="submit"
-          disabled={submitting}
+          disabled={submitting || disabled}
           className="w-full rounded-xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:opacity-50"
         >
           {submitting
